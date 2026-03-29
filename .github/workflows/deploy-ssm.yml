@@ -1,0 +1,184 @@
+name: Deploy via SSM (No SSH Keys)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  id-token: write    # required for OIDC
+  contents: read
+
+jobs:
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install and test
+        run: |
+          pip install -r app/requirements.txt
+          python -m pytest app/tests/ -v --tb=short
+
+  deploy:
+    name: Deploy via SSM
+    runs-on: [self-hosted, aws, private]
+    needs: test
+    environment: production
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # ── Authenticate to AWS via OIDC — no secrets needed ──────────────────
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+          role-session-name: GitHubDeploy-${{ github.run_id }}
+
+      # ── Package and upload artifact to S3 ─────────────────────────────────
+      - name: Package and upload to S3
+        run: |
+          ARTIFACT="app-${{ github.sha }}.tar.gz"
+          tar -czf $ARTIFACT ./app/ ./scripts/
+
+          aws s3 cp $ARTIFACT \
+            s3://${{ secrets.S3_BUCKET }}/artifacts/$ARTIFACT
+
+          # Also upload as latest for easy reference
+          aws s3 cp $ARTIFACT \
+            s3://${{ secrets.S3_BUCKET }}/artifacts/app-latest.tar.gz
+
+          echo "ARTIFACT=$ARTIFACT" >> $GITHUB_ENV
+          echo "Uploaded: s3://${{ secrets.S3_BUCKET }}/artifacts/$ARTIFACT"
+
+      # ── Send deploy command to app EC2 via SSM ────────────────────────────
+      - name: Deploy via SSM SendCommand
+        run: |
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "${{ secrets.APP_INSTANCE_ID }}" \
+            --document-name "AWS-RunShellScript" \
+            --comment "Deploy ${{ github.sha }}" \
+            --parameters commands="[
+              \"set -e\",
+              \"echo '=== Deploy started: $(date) ===' >> /home/ec2-user/deploy.log\",
+              \"echo 'Commit: ${{ github.sha }}' >> /home/ec2-user/deploy.log\",
+              \"cd /home/ec2-user\",
+              \"aws s3 cp s3://${{ secrets.S3_BUCKET }}/artifacts/app-latest.tar.gz /tmp/app-latest.tar.gz\",
+              \"mkdir -p /home/ec2-user/app\",
+              \"tar -xzf /tmp/app-latest.tar.gz -C /home/ec2-user/\",
+              \"chmod +x /home/ec2-user/scripts/*.sh\",
+              \"APP_ENV=${{ secrets.APP_ENV }} bash /home/ec2-user/scripts/deploy.sh\",
+              \"echo '=== Deploy complete: $(date) ===' >> /home/ec2-user/deploy.log\"
+            ]" \
+            --timeout-seconds 300 \
+            --query "Command.CommandId" \
+            --output text)
+
+          echo "SSM Command ID: $COMMAND_ID"
+          echo "COMMAND_ID=$COMMAND_ID" >> $GITHUB_ENV
+
+      # ── Wait for SSM command to complete ──────────────────────────────────
+      - name: Wait for SSM command
+        run: |
+          echo "Waiting for command $COMMAND_ID to complete..."
+
+          for i in $(seq 1 30); do
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" \
+              --instance-id "${{ secrets.APP_INSTANCE_ID }}" \
+              --query "Status" \
+              --output text 2>/dev/null || echo "Pending")
+
+            echo "Attempt $i/30 — Status: $STATUS"
+
+            if [ "$STATUS" = "Success" ]; then
+              echo "✅ SSM command succeeded"
+              break
+            elif [ "$STATUS" = "Failed" ] || \
+                 [ "$STATUS" = "Cancelled" ] || \
+                 [ "$STATUS" = "TimedOut" ]; then
+              echo "❌ SSM command failed with status: $STATUS"
+
+              # Print the output for debugging
+              aws ssm get-command-invocation \
+                --command-id "$COMMAND_ID" \
+                --instance-id "${{ secrets.APP_INSTANCE_ID }}" \
+                --query "{stdout:StandardOutputContent,stderr:StandardErrorContent}" \
+                --output json
+              exit 1
+            fi
+
+            if [ "$i" -eq 30 ]; then
+              echo "❌ Timed out waiting for SSM command"
+              exit 1
+            fi
+
+            sleep 10
+          done
+
+      # ── Print SSM command output ───────────────────────────────────────────
+      - name: Print deploy output
+        if: always()
+        run: |
+          aws ssm get-command-invocation \
+            --command-id "$COMMAND_ID" \
+            --instance-id "${{ secrets.APP_INSTANCE_ID }}" \
+            --query "{
+              Status:Status,
+              stdout:StandardOutputContent,
+              stderr:StandardErrorContent
+            }" \
+            --output json
+
+      # ── Health check via SSM ───────────────────────────────────────────────
+      - name: Health check via SSM
+        run: |
+          HC_COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "${{ secrets.APP_INSTANCE_ID }}" \
+            --document-name "AWS-RunShellScript" \
+            --comment "Health check ${{ github.sha }}" \
+            --parameters commands="[
+              \"curl -sf http://localhost:8080/health || exit 1\",
+              \"curl -sf http://localhost:8080/info || exit 1\",
+              \"echo 'All health checks passed'\"
+            ]" \
+            --timeout-seconds 60 \
+            --query "Command.CommandId" \
+            --output text)
+
+          sleep 10
+
+          STATUS=$(aws ssm get-command-invocation \
+            --command-id "$HC_COMMAND_ID" \
+            --instance-id "${{ secrets.APP_INSTANCE_ID }}" \
+            --query "Status" \
+            --output text)
+
+          if [ "$STATUS" = "Success" ]; then
+            echo "✅ Health check passed"
+          else
+            echo "❌ Health check failed"
+            aws ssm get-command-invocation \
+              --command-id "$HC_COMMAND_ID" \
+              --instance-id "${{ secrets.APP_INSTANCE_ID }}" \
+              --query "{stdout:StandardOutputContent,stderr:StandardErrorContent}" \
+              --output json
+            exit 1
+          fi
+
+      - name: Deployment summary
+        if: success()
+        run: |
+          echo "✅ Deployment successful"
+          echo "   Commit  : ${{ github.sha }}"
+          echo "   Actor   : ${{ github.actor }}"
+          echo "   Artifact: s3://${{ secrets.S3_BUCKET }}/artifacts/${{ env.ARTIFACT }}"
