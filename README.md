@@ -165,7 +165,6 @@ your-app/
 ├── .github/
 │   └── workflows/
 │       ├── deploy-ssm.yml          ← main deploy workflow
-│       └── health-check.yml    ← optional post-deploy check
 ├── app/
 │   ├── app.py                  ← your application
 │   └── requirements.txt
